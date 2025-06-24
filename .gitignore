@@ -1,0 +1,4 @@
+my-next-app/node_modules/
+Backend MY-NEXT-APP/node_modules/
+.env
+.DS_Store
