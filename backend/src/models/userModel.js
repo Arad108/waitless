@@ -1,6 +1,6 @@
-// models/userModel.js
+// src/models/userModel.js
 const mongoose = require('mongoose');
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs'); // standard standard is bcryptjs for Node
 
 const userSchema = new mongoose.Schema({
     email: {
@@ -13,7 +13,7 @@ const userSchema = new mongoose.Schema({
     password: {
         type: String,
         required: true,
-        select: false // Don't include password in normal queries
+        select: false 
     },
     full_name: {
         type: String,
@@ -29,6 +29,11 @@ const userSchema = new mongoose.Schema({
         type: mongoose.Schema.Types.Mixed,
         default: null
     },
+    isActive: {
+        type: Boolean,
+        default: true,
+        select: false // Hides this internal flag from API responses
+    },
     preferences: {
         type: mongoose.Schema.Types.Mixed,
         default: null
@@ -36,43 +41,23 @@ const userSchema = new mongoose.Schema({
     profile_complete: {
         type: Boolean,
         default: false
-    },
-    created_at: {
-        type: Date,
-        default: Date.now
-    },
-    updated_at: {
-        type: Date,
-        default: Date.now
+    }
+}, {
+    timestamps: {
+        createdAt: 'created_at',
+        updatedAt: 'updated_at'
     }
 });
 
-// Update timestamp before save
-userSchema.pre('save', function(next) {
-    this.updated_at = new Date();
+// Single point of hashing - only happens if password is changed/new
+userSchema.pre('save', async function(next) {
+    if (!this.isModified('password')) return next();
+    this.password = await bcrypt.hash(this.password, 10);
     next();
 });
 
-// Hash password before saving
-userSchema.pre('save', async function(next) {
-    if (!this.isModified('password')) return next();
-    
-    try {
-        const salt = await bcrypt.genSalt(10);
-        this.password = await bcrypt.hash(this.password, salt);
-        next();
-    } catch (error) {
-        next(error);
-    }
-});
-
-// Method to compare password
 userSchema.methods.comparePassword = async function(candidatePassword) {
-    try {
-        return await bcrypt.compare(candidatePassword, this.password);
-    } catch (error) {
-        throw error;
-    }
+    return await bcrypt.compare(candidatePassword, this.password);
 };
 
 module.exports = mongoose.model('User', userSchema);

@@ -1,8 +1,10 @@
 // middleware/authMiddleware.js
 const jwt = require('jsonwebtoken');
 const User = require('../models/userModel');
+const Business = require('../models/businessModel'); // Required for isBusinessOwner
+const rateLimit = require('express-rate-limit');
 
-// Verify JWT token
+// 1. Verify JWT token
 const verifyToken = async (req, res, next) => {
     try {
         const token = req.header('Authorization')?.replace('Bearer ', '');
@@ -16,13 +18,13 @@ const verifyToken = async (req, res, next) => {
 
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
         
-        // Check if user still exists
-        const user = await User.findById(decoded.id).select('-password');
+        // Check if user still exists AND is an active account
+        const user = await User.findOne({ _id: decoded.id, isActive: true }).select('-password');
         
         if (!user) {
             return res.status(401).json({ 
                 status: 'error',
-                message: 'User no longer exists.' 
+                message: 'User no longer exists or has been deactivated.' 
             });
         }
 
@@ -49,7 +51,7 @@ const verifyToken = async (req, res, next) => {
     }
 };
 
-// Check user role
+// 2. Check user role
 const checkRole = (...roles) => {
     return (req, res, next) => {
         if (!req.user) {
@@ -70,10 +72,10 @@ const checkRole = (...roles) => {
     };
 };
 
-// Check if user is business owner
+// 3. Check if user is business owner
 const isBusinessOwner = async (req, res, next) => {
     try {
-        const businessId = req.params.id;
+        const businessId = req.params.id; // Assuming route is like /business/:id
         const userId = req.user._id;
 
         const business = await Business.findById(businessId);
@@ -85,7 +87,8 @@ const isBusinessOwner = async (req, res, next) => {
             });
         }
 
-        if (business.ownerId.toString() !== userId.toString()) {
+        // Allow Admins to bypass this check, otherwise strict owner check
+        if (business.ownerId.toString() !== userId.toString() && req.user.role !== 'admin') {
             return res.status(403).json({ 
                 status: 'error',
                 message: 'You do not have permission to manage this business' 
@@ -99,9 +102,7 @@ const isBusinessOwner = async (req, res, next) => {
     }
 };
 
-// Rate limiting middleware
-const rateLimit = require('express-rate-limit');
-
+// 4. Rate limiting middleware
 const apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
     max: 100, // Limit each IP to 100 requests per windowMs
@@ -111,7 +112,7 @@ const apiLimiter = rateLimit({
     }
 });
 
-// Refresh token middleware
+// 5. Refresh token middleware
 const handleRefreshToken = async (req, res, next) => {
     try {
         const refreshToken = req.cookies.refreshToken;
@@ -124,12 +125,14 @@ const handleRefreshToken = async (req, res, next) => {
         }
 
         const decoded = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET);
-        const user = await User.findById(decoded.id);
+        
+        // Ensure user is still active before giving a new token
+        const user = await User.findOne({ _id: decoded.id, isActive: true });
 
         if (!user) {
             return res.status(401).json({ 
                 status: 'error',
-                message: 'User not found.' 
+                message: 'User not found or deactivated.' 
             });
         }
 

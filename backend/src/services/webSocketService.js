@@ -1,77 +1,102 @@
+// src/services/webSocketService.js
 const WebSocket = require('ws');
+const redis = require('redis');
 
-let wss; // WebSocket Server
+let wss;
+let pubClient; // Publisher: Sends messages to Redis
+let subClient; // Subscriber: Listens for messages from Redis
 
-// Initialize WebSocket Server
-const initializeWebSocketServer = (server) => {
-  // Create WebSocket server instance using HTTP server
-  wss = new WebSocket.Server({ server });
+const initializeWebSocketServer = async (server) => {
+    // 1. Initialize Redis Clients
+    // In production, REDIS_URL will be provided by your cloud host (e.g., AWS ElastiCache)
+    const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+    
+    pubClient = redis.createClient({ url: redisUrl });
+    subClient = pubClient.duplicate(); // Subscribers must be on a dedicated client
 
-  // When a new client connects to the WebSocket server
-  wss.on('connection', (ws) => {
-    console.log('New WebSocket connection established');
+    pubClient.on('error', (err) => console.error('Redis Publisher Error:', err));
+    subClient.on('error', (err) => console.error('Redis Subscriber Error:', err));
 
-    // Send a welcome message to the new client
-    ws.send(
-      JSON.stringify({
-        type: 'WELCOME',
-        message: 'Welcome to the WebSocket server!',
-      })
-    );
+    await pubClient.connect();
+    await subClient.connect();
+    console.log('Connected to Redis Pub/Sub successfully');
 
-    // Listen for incoming messages from clients
-    ws.on('message', (message) => {
-      console.log('Received message:', message);
-      // Process the message and update the queue data
-      // ...
-      broadcastQueueUpdate();
+    // 2. Initialize WebSocket Server
+    wss = new WebSocket.Server({ server });
+
+    // 3. Listen to Redis for updates from ANY server instance
+    // Whenever ANY server publishes to 'QUEUE_UPDATES', this specific server hears it
+    await subClient.subscribe('QUEUE_UPDATES', (message) => {
+        try {
+            const parsedMessage = JSON.parse(message);
+            // Now that this server heard the update, it sends it to its own local clients
+            broadcastToLocalClients(parsedMessage.businessId, parsedMessage.type, parsedMessage.data);
+        } catch (error) {
+            console.error('Failed to parse Redis message:', error);
+        }
     });
 
-    // Handle disconnections
-    ws.on('close', () => {
-      console.log('Client disconnected');
-      // Update the queue data and broadcast the changes
-      // ...
-      broadcastQueueUpdate();
+    // 4. Handle incoming browser connections
+    wss.on('connection', (ws) => {
+        console.log('New browser connection established');
+        ws.subscriptions = new Set();
+
+        ws.on('message', (message) => {
+            try {
+                const parsed = JSON.parse(message);
+                if (parsed.type === 'SUBSCRIBE_QUEUE') {
+                    ws.subscriptions.add(parsed.businessId.toString());
+                }
+                if (parsed.type === 'UNSUBSCRIBE_QUEUE') {
+                    ws.subscriptions.delete(parsed.businessId.toString());
+                }
+            } catch (error) {
+                console.error('WebSocket message parse error:', error);
+            }
+        });
+
+        ws.on('close', () => {
+            ws.subscriptions.clear();
+        });
     });
-  });
 };
 
-// Store the queue data
-let queue = [];
-let queueLength = 0;
-let estimatedWaitTime = 0;
+// ==========================================
+// BROADCASTING LOGIC
+// ==========================================
 
-// Broadcast queue update to all connected clients
-const broadcastQueueUpdate = () => {
-  broadcastToClients({
-    type: 'QUEUE_UPDATED',
-    queue,
-    queueLength,
-    estimatedWaitTime,
-  });
+// This is called by your QueueService when a database change happens
+const broadcastToBusiness = async (businessId, type, data) => {
+    if (!pubClient) return;
+
+    // We do NOT send directly to the browser here.
+    // Instead, we publish the event to the central Redis hub.
+    const payload = JSON.stringify({
+        businessId: businessId.toString(),
+        type,
+        data
+    });
+
+    await pubClient.publish('QUEUE_UPDATES', payload);
 };
 
-// Broadcast message to all connected clients
-const broadcastToClients = (data) => {
-  if (wss && wss.clients) {
+// This internal helper is called when Redis notifies the server of an update
+const broadcastToLocalClients = (businessId, type, data) => {
+    if (!wss) return;
+
     wss.clients.forEach((client) => {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(JSON.stringify(data));
-      }
+        // Check if the client is connected AND subscribed to this room
+        if (client.readyState === WebSocket.OPEN && client.subscriptions.has(businessId)) {
+            client.send(JSON.stringify({
+                type,
+                businessId,
+                data
+            }));
+        }
     });
-  }
-};
-
-// Function to calculate estimated wait time
-const calculateEstimatedWaitTime = (queue) => {
-  // Implement your logic to calculate the estimated wait time
-  // based on the current queue data
-  // ...
-  return 10; // Example, replace with your actual calculation
 };
 
 module.exports = {
-  initializeWebSocketServer,
-  broadcastToClients,
+    initializeWebSocketServer,
+    broadcastToBusiness
 };

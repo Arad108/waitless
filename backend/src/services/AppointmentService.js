@@ -1,5 +1,4 @@
 // src/services/AppointmentService.js
-
 const mongoose = require('mongoose');
 const Appointment = require('../models/appointmentModel');
 const Business = require('../models/businessModel');

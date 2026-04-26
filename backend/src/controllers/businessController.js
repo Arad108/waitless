@@ -1,171 +1,212 @@
-// controllers/businessController.js
+// src/controllers/businessController.js
 const Business = require('../models/businessModel');
 
-// Get all businesses
-const getAllBusinesses = async (req, res) => {
-    try {
-        const businesses = await Business.find()
-            .populate('ownerId', 'name email')
-            .sort({ createdAt: -1 });
+class BusinessController {
+    static #instance;
 
-        res.status(200).json(businesses);
-    } catch (error) {
-        res.status(500).json({ 
-            status: 'error',
-            message: 'Error fetching businesses',
-            error: error.message 
-        });
-    }
-};
-
-// Get business by ID
-const getBusinessById = async (req, res) => {
-    try {
-        const business = await Business.findById(req.params.id)
-            .populate('ownerId', 'name email');
-
-        if (!business) {
-            return res.status(404).json({ 
-                status: 'error',
-                message: 'Business not found' 
-            });
+    constructor() {
+        if (BusinessController.#instance) {
+            return BusinessController.#instance;
         }
-
-        res.status(200).json(business);
-    } catch (error) {
-        res.status(500).json({ 
-            status: 'error',
-            message: 'Error fetching business',
-            error: error.message 
-        });
+        BusinessController.#instance = this;
     }
-};
 
-// Create business
-const createBusiness = async (req, res) => {
-    try {
-        const newBusiness = new Business({
-            ...req.body,
-            ownerId: req.user._id
-        });
+    // 1. Get all businesses with pagination and rich filters
+    getAllBusinesses = async (req, res) => {
+        try {
+            const page = parseInt(req.query.page) || 1;
+            const limit = parseInt(req.query.limit) || 10;
+            const skip = (page - 1) * limit;
 
-        const savedBusiness = await newBusiness.save();
-        const populatedBusiness = await Business.findById(savedBusiness._id)
-            .populate('ownerId', 'name email');
+            const queryObj = { isActive: true };
+            
+            if (req.query.category) queryObj.category = req.query.category;
+            if (req.query.city) queryObj['address.city'] = new RegExp(req.query.city, 'i');
+            if (req.query.minRating) queryObj.rating = { $gte: parseFloat(req.query.minRating) };
 
-        res.status(201).json({
-            status: 'success',
-            message: 'Business created successfully',
-            business: populatedBusiness
-        });
-    } catch (error) {
-        res.status(500).json({ 
-            status: 'error',
-            message: 'Error creating business',
-            error: error.message 
-        });
-    }
-};
+            const [businesses, total] = await Promise.all([
+                Business.find(queryObj)
+                    .select('-__v')
+                    .populate('ownerId', 'name email')
+                    .sort({ rating: -1, createdAt: -1 })
+                    .skip(skip)
+                    .limit(limit),
+                Business.countDocuments(queryObj)
+            ]);
 
-// Update business
-const updateBusiness = async (req, res) => {
-    try {
-        const updatedBusiness = await Business.findByIdAndUpdate(
-            req.params.id,
-            { ...req.body, updatedAt: Date.now() },
-            { new: true, runValidators: true }
-        ).populate('ownerId', 'name email');
-
-        if (!updatedBusiness) {
-            return res.status(404).json({ 
-                status: 'error',
-                message: 'Business not found' 
+            res.status(200).json({
+                status: 'success',
+                results: businesses.length,
+                pagination: {
+                    currentPage: page,
+                    totalPages: Math.ceil(total / limit),
+                    totalResults: total,
+                    resultsPerPage: limit
+                },
+                data: businesses
             });
+        } catch (error) {
+            res.status(500).json({ status: 'error', message: error.message });
         }
+    };
 
-        res.status(200).json({
-            status: 'success',
-            message: 'Business updated successfully',
-            business: updatedBusiness
-        });
-    } catch (error) {
-        res.status(500).json({ 
-            status: 'error',
-            message: 'Error updating business',
-            error: error.message 
-        });
-    }
-};
+    // 2. Get single business with live "isOpen" check
+    getBusinessById = async (req, res) => {
+        try {
+            const business = await Business.findOne({ _id: req.params.id, isActive: true })
+                .populate('ownerId', 'name email')
+                .select('-__v');
 
-// Delete business
-const deleteBusiness = async (req, res) => {
-    try {
-        const deletedBusiness = await Business.findByIdAndDelete(req.params.id);
+            if (!business) {
+                return res.status(404).json({ status: 'error', message: 'Business not found' });
+            }
 
-        if (!deletedBusiness) {
-            return res.status(404).json({ 
-                status: 'error',
-                message: 'Business not found' 
+            const isCurrentlyOpen = business.isOpen();
+
+            res.status(200).json({
+                status: 'success',
+                data: {
+                    ...business.toObject(),
+                    isCurrentlyOpen
+                }
             });
+        } catch (error) {
+            res.status(500).json({ status: 'error', message: error.message });
         }
+    };
 
-        res.status(200).json({
-            status: 'success',
-            message: 'Business deleted successfully'
-        });
-    } catch (error) {
-        res.status(500).json({ 
-            status: 'error',
-            message: 'Error deleting business',
-            error: error.message 
-        });
-    }
-};
+    // 3. Advanced Geospatial & Text Search
+    searchBusinesses = async (req, res) => {
+        try {
+            const { query, category, city, minRating, maxDistance, lat, lng } = req.query;
+            let searchQuery = { isActive: true };
 
-// Get businesses by owner
-const getBusinessesByOwner = async (req, res) => {
-    try {
-        const businesses = await Business.find({ ownerId: req.params.ownerId })
-            .populate('ownerId', 'name email')
-            .sort({ createdAt: -1 });
+            if (query) {
+                searchQuery.$or = [
+                    { name: { $regex: query, $options: 'i' } },
+                    { 'address.city': { $regex: query, $options: 'i' } },
+                    { services: { $regex: query, $options: 'i' } }
+                ];
+            }
 
-        res.status(200).json(businesses);
-    } catch (error) {
-        res.status(500).json({ 
-            status: 'error',
-            message: 'Error fetching businesses',
-            error: error.message 
-        });
-    }
-};
+            if (category) searchQuery.category = category;
+            if (city) searchQuery['address.city'] = new RegExp(city, 'i');
+            if (minRating) searchQuery.rating = { $gte: parseFloat(minRating) };
 
-// Toggle business status
-const toggleBusinessStatus = async (req, res) => {
-    try {
-        const business = await Business.findById(req.params.id);
-        business.isActive = !business.isActive;
-        await business.save();
+            if (lat && lng && maxDistance) {
+                searchQuery.location = {
+                    $near: {
+                        $geometry: { type: 'Point', coordinates: [parseFloat(lng), parseFloat(lat)] },
+                        $maxDistance: parseInt(maxDistance) * 1000 
+                    }
+                };
+            }
 
-        res.status(200).json({
-            status: 'success',
-            message: `Business ${business.isActive ? 'activated' : 'deactivated'} successfully`,
-            business
-        });
-    } catch (error) {
-        res.status(500).json({ 
-            status: 'error',
-            message: 'Error toggling business status',
-            error: error.message 
-        });
-    }
-};
+            const businesses = await Business.find(searchQuery).select('-__v').sort({ rating: -1 });
 
-module.exports = {
-    getAllBusinesses,
-    getBusinessById,
-    createBusiness,
-    updateBusiness,
-    deleteBusiness,
-    getBusinessesByOwner,
-    toggleBusinessStatus
-};
+            res.status(200).json({ status: 'success', results: businesses.length, data: businesses });
+        } catch (error) {
+            res.status(500).json({ status: 'error', message: error.message });
+        }
+    };
+
+    // 4. Create business
+    createBusiness = async (req, res) => {
+        try {
+            const newBusiness = new Business({
+                ...req.body,
+                ownerId: req.user._id
+            });
+
+            const savedBusiness = await newBusiness.save();
+            res.status(201).json({ status: 'success', data: savedBusiness });
+        } catch (error) {
+            res.status(400).json({ status: 'error', message: error.message });
+        }
+    };
+
+    // 5. Update business
+    updateBusiness = async (req, res) => {
+        try {
+            const updatedBusiness = await Business.findByIdAndUpdate(
+                req.params.id,
+                { ...req.body }, 
+                { new: true, runValidators: true }
+            );
+
+            if (!updatedBusiness) return res.status(404).json({ status: 'error', message: 'Business not found' });
+            res.status(200).json({ status: 'success', data: updatedBusiness });
+        } catch (error) {
+            res.status(400).json({ status: 'error', message: error.message });
+        }
+    };
+
+    // 6. Soft Delete Business
+    deleteBusiness = async (req, res) => {
+        try {
+            const business = await Business.findByIdAndUpdate(
+                req.params.id,
+                { isActive: false },
+                { new: true }
+            );
+
+            if (!business) return res.status(404).json({ status: 'error', message: 'Business not found' });
+            res.status(200).json({ status: 'success', message: 'Business successfully deactivated' });
+        } catch (error) {
+            res.status(500).json({ status: 'error', message: error.message });
+        }
+    };
+
+    // 7. Get businesses by specific owner
+    getBusinessesByOwner = async (req, res) => {
+        try {
+            const businesses = await Business.find({ ownerId: req.params.ownerId, isActive: true })
+                .sort({ createdAt: -1 });
+            res.status(200).json({ status: 'success', data: businesses });
+        } catch (error) {
+            res.status(500).json({ status: 'error', message: error.message });
+        }
+    };
+
+    // 8. Toggle Business Status (RESTORED FROM ORIGINAL FILE)
+    toggleBusinessStatus = async (req, res) => {
+        try {
+            const business = await Business.findById(req.params.id);
+            if (!business) return res.status(404).json({ status: 'error', message: 'Business not found' });
+            
+            business.isActive = !business.isActive;
+            await business.save();
+
+            res.status(200).json({
+                status: 'success',
+                message: `Business ${business.isActive ? 'activated' : 'deactivated'} successfully`,
+                data: business
+            });
+        } catch (error) {
+            res.status(500).json({ status: 'error', message: error.message });
+        }
+    };
+
+    // 9. Aggregation / Stats
+    getSystemStats = async (req, res) => {
+        try {
+            const stats = await Business.aggregate([
+                {
+                    $group: {
+                        _id: null,
+                        totalBusinesses: { $sum: 1 },
+                        averageRating: { $avg: '$rating' },
+                        businessesByCategory: {
+                            $push: { category: '$category', count: 1 }
+                        }
+                    }
+                }
+            ]);
+            res.status(200).json({ status: 'success', data: stats[0] || {} });
+        } catch (error) {
+            res.status(500).json({ status: 'error', message: error.message });
+        }
+    };
+}
+
+module.exports = new BusinessController();

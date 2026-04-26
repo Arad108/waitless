@@ -1,127 +1,133 @@
+// src/services/QueueService.js
+const Queue = require('../models/queueModel');
+const Service = require('../models/serviceModel');
+const { broadcastToBusiness } = require('./webSocketService');
+
+const kafkaService = require('./kafkaService');
+
 class QueueService {
-    constructor(database, websocket) {
-        this.database = database;
-        this.ws = websocket;
+    
+    // 1. Calculate wait time dynamically based on the DB
+    static async calculateWaitTime(businessId, serviceId) {
+        const service = await Service.findById(serviceId);
+        if (!service) throw new Error('Service not found');
+
+        // Count how many people are currently waiting
+        const waitingCount = await Queue.countDocuments({
+            business_id: businessId,
+            status: 'waiting'
+        });
+
+        const baseWaitTime = service.durationMinutes * waitingCount;
+        const bufferTime = Math.ceil(baseWaitTime * 0.1); // 10% buffer
+        return baseWaitTime + bufferTime;
     }
 
-    // Add a user to the queue
-    async addToQueue(businessId, userId, serviceId, isPriorityPass) {
-        try {
-            // Calculate estimated wait time based on current queue and service duration
-            const estimatedWaitTime = await this.calculateWaitTime(businessId, serviceId);
+    // 2. Add to Queue (NOW WITH GUEST SUPPORT & PRIORITY PASS)
+    static async addToQueue({ businessId, serviceId, userId, customerDetails, isPriorityPass }) {
+        const estimatedWaitTime = await this.calculateWaitTime(businessId, serviceId);
 
-            // Add entry to the queue in Firebase Realtime Database
-            const queueRef = this.database.ref(`queues/${businessId}`).push();  // Push new entry to the business queue
-            const entry = {
-                userId,
-                serviceId,
-                status: 'waiting',
-                estimatedWaitTime,
-                priorityPass: isPriorityPass,
-                checkInTime: Date.now(),  // You can add more fields as needed
-            };
+        // Create the new entry, accommodating either a registered user OR a guest
+        const newQueueEntry = new Queue({
+            business_id: businessId,
+            service_id: serviceId,
+            user_id: userId || null, 
+            customer_details: customerDetails || null, // For walk-ins without accounts
+            status: 'waiting',
+            estimated_wait_time: estimatedWaitTime,
+            priority_pass: isPriorityPass || false,
+            created_at: new Date()
+        });
 
-            // Set the new queue entry in Firebase
-            await queueRef.set(entry);
+        const savedEntry = await newQueueEntry.save();
+        
+        // Populate references for the frontend
+        const populatedEntry = await Queue.findById(savedEntry._id)
+            .populate('user_id', 'full_name email')
+            .populate('service_id', 'name durationMinutes');
 
-            // Notify all clients about queue update
-            this.ws.broadcast(businessId, 'QUEUE_UPDATED', {
-                queueLength: await this.getQueueLength(businessId),
-                estimatedWaitTime,
-            });
+        // 🔥 Broadcast the new entry to the specific business room 🔥
+        broadcastToBusiness(businessId, 'QUEUE_JOINED', populatedEntry);
 
-            return { id: queueRef.key, ...entry };  // Return the entry with its Firebase ID
-        } catch (error) {
-            console.error('Error adding to queue:', error);
-            throw error;
-        }
+        // Also broadcast the updated queue length so dashboard badges/counters update
+        const newLength = await this.getQueueLength(businessId);
+        broadcastToBusiness(businessId, 'QUEUE_LENGTH_UPDATED', { queueLength: newLength });
+
+        return populatedEntry;
     }
 
-    // Calculate the estimated wait time
-    async calculateWaitTime(businessId, serviceId) {
-        try {
-            // Fetch service duration from Firebase
-            const serviceSnapshot = await this.database.ref(`services/${serviceId}`).once('value');
-            const service = serviceSnapshot.val();
+    // 3. Update status
+    static async updateQueueStatus(entryId, newStatus) {
+        const updates = { status: newStatus, updated_at: new Date() };
+        
+        if (newStatus === 'in_progress') updates.start_time = new Date();
+        if (newStatus === 'completed') updates.end_time = new Date();
 
-            // Get the queue status (number of waiting entries)
-            const queueSnapshot = await this.database.ref(`queues/${businessId}`).orderByChild('status').equalTo('waiting').once('value');
-            const queueLength = queueSnapshot.numChildren();
+        const updatedEntry = await Queue.findByIdAndUpdate(
+            entryId,
+            updates,
+            { new: true }
+        ).populate('user_id', 'full_name email phone').populate('service_id', 'name');
 
-            // Calculate the estimated wait time (this is a simple example, you can adjust it as needed)
-            const baseWaitTime = service.durationMinutes * queueLength;
-            const bufferTime = Math.ceil(baseWaitTime * 0.1);
+        if (!updatedEntry) throw new Error('Queue entry not found');
 
-            return baseWaitTime + bufferTime;
-        } catch (error) {
-            console.error('Error calculating wait time:', error);
-            throw error;
-        }
-    }
+        // 1. Broadcast UI Update (Redis/WebSockets)
+        broadcastToBusiness(updatedEntry.business_id, 'QUEUE_STATUS_CHANGED', updatedEntry);
 
-    // Update the status of a queue entry
-    async updateQueueStatus(entryId, newStatus) {
-        try {
-            const entryRef = this.database.ref(`queues/${entryId}`);
-
-            const updates = { status: newStatus };
+        // 2. TRIGGER KAFKA NOTIFICATIONS (Background processing)
+        if (updatedEntry.user_id) { // Only send if it's a registered user, not a guest
+            
             if (newStatus === 'in_progress') {
-                updates.startTime = Date.now();
-            } else if (newStatus === 'completed') {
-                updates.endTime = Date.now();
+                // Tell Kafka to trigger an "It's your turn!" notification
+                await kafkaService.publishNotificationEvent('USER_TURN_STARTED', {
+                    userId: updatedEntry.user_id._id,
+                    email: updatedEntry.user_id.email,
+                    phone: updatedEntry.user_id.phone,
+                    name: updatedEntry.user_id.full_name,
+                    serviceName: updatedEntry.service_id.name
+                });
             }
 
-            // Update the entry in Firebase
-            await entryRef.update(updates);
-
-            // If completed, update analytics (you can implement this as needed)
             if (newStatus === 'completed') {
-                await this.updateAnalytics(entryId);
+                // Tell Kafka to trigger a "Thank you / Feedback" notification
+                await kafkaService.publishNotificationEvent('SERVICE_COMPLETED', {
+                    userId: updatedEntry.user_id._id,
+                    email: updatedEntry.user_id.email,
+                    name: updatedEntry.user_id.full_name
+                });
             }
-
-            return { entryId, ...updates };
-        } catch (error) {
-            console.error('Error updating queue status:', error);
-            throw error;
         }
+
+        return updatedEntry;
     }
 
-    // Get the current queue status for a business
-    async getQueueStatus(businessId) {
-        try {
-            const queueSnapshot = await this.database.ref(`queues/${businessId}`).orderByChild('status').equalTo('waiting').once('value');
-            const queueEntries = queueSnapshot.val();
-
-            if (!queueEntries) return [];
-
-            const result = Object.keys(queueEntries).map(key => {
-                const entry = queueEntries[key];
-                entry.id = key;  // Add Firebase key to entry
-                return entry;
-            });
-
-            return result;
-        } catch (error) {
-            console.error('Error fetching queue status:', error);
-            throw error;
-        }
+    // 4. Fetch the active queue
+    static async getActiveQueue(businessId) {
+        return await Queue.find({
+            business_id: businessId,
+            status: { $in: ['waiting', 'in_progress'] }
+        })
+        .sort({ 
+            priority_pass: -1, // Priority passes float to the top of the line
+            created_at: 1      // Then standard FIFO (First-In-First-Out) for everyone else
+        }) 
+        .populate('user_id', 'full_name')
+        .populate('service_id', 'name durationMinutes');
     }
 
-    // Get the length of the queue for a business
-    async getQueueLength(businessId) {
-        try {
-            const queueSnapshot = await this.database.ref(`queues/${businessId}`).once('value');
-            return queueSnapshot.numChildren();
-        } catch (error) {
-            console.error('Error getting queue length:', error);
-            throw error;
-        }
+    // 5. Get Queue Length (Restored from your Firebase code)
+    static async getQueueLength(businessId) {
+        return await Queue.countDocuments({
+            business_id: businessId,
+            status: 'waiting'
+        });
     }
 
-    // Example method to update analytics (implement as needed)
-    async updateAnalytics(entryId) {
-        // Your logic for updating analytics goes here
-        console.log(`Updating analytics for entry: ${entryId}`);
+    // 6. Update Analytics (Restored from your Firebase code)
+    static async updateAnalytics(entryId) {
+        // In the future, this can write to an 'Analytics' database collection
+        // tracking average wait times, peak hours, and staff efficiency.
+        console.log(`[Analytics] Queue entry ${entryId} completed. Processing metrics...`);
     }
 }
 

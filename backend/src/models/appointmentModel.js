@@ -4,7 +4,7 @@ const mongoose = require('mongoose');
 const appointmentSchema = new mongoose.Schema({
     businessId: {
         type: mongoose.Schema.Types.ObjectId,
-        ref: 'Business',
+        ref: 'Business', // NOW REFERENCES THE UNIFIED BASE CLASS
         required: true
     },
     serviceId: {
@@ -12,23 +12,20 @@ const appointmentSchema = new mongoose.Schema({
         ref: 'Service',
         required: true
     },
-    customerDetails: {
-        name: {
-            type: String,
-            required: true
-        },
-        email: {
-            type: String,
-            required: true
-        },
-        phone: {
-            type: String,
-            required: true
-        }
+    userId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+        default: null // Handles registered users
+    },
+    customerDetails: { // Handles walk-ins / unregistered users
+        name: { type: String, required: true },
+        email: { type: String, required: true },
+        phone: { type: String, required: true }
     },
     status: {
         type: String,
-        enum: ['pending', 'confirmed', 'completed', 'cancelled', 'scheduled'],
+        // Added 'in_progress' and 'no_show' for better queue management
+        enum: ['pending', 'scheduled', 'confirmed', 'in_progress', 'completed', 'cancelled', 'no_show'],
         default: 'scheduled'
     },
     appointmentTime: {
@@ -43,19 +40,6 @@ const appointmentSchema = new mongoose.Schema({
         type: String,
         default: ''
     },
-    createdAt: {
-        type: Date,
-        default: Date.now
-    },
-    updatedAt: {
-        type: Date
-    },
-    // Optional userId for registered users
-    userId: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: 'User'
-    },
-    // Additional metadata
     metadata: {
         source: {
             type: String,
@@ -76,17 +60,22 @@ const appointmentSchema = new mongoose.Schema({
         }
     }
 }, {
-    timestamps: true // This will automatically manage createdAt and updatedAt
+    timestamps: true 
 });
+
+// ==========================================
+// YOUR ORIGINAL INDEXES, VIRTUALS & METHODS
+// ==========================================
 
 // Indexes for better query performance
 appointmentSchema.index({ businessId: 1, appointmentTime: 1 });
 appointmentSchema.index({ 'customerDetails.email': 1 });
 appointmentSchema.index({ status: 1 });
+appointmentSchema.index({ userId: 1 });
 
 // Virtual for appointment duration
 appointmentSchema.virtual('duration').get(function() {
-    return (this.appointmentEndTime - this.appointmentTime) / (1000 * 60); // Duration in minutes
+    return (this.appointmentEndTime - this.appointmentTime) / (1000 * 60); 
 });
 
 // Method to check if appointment can be cancelled
@@ -94,10 +83,10 @@ appointmentSchema.methods.canBeCancelled = function() {
     const now = new Date();
     const appointmentDate = new Date(this.appointmentTime);
     const hoursUntilAppointment = (appointmentDate - now) / (1000 * 60 * 60);
-    return hoursUntilAppointment > 24; // Can cancel if more than 24 hours before appointment
+    return hoursUntilAppointment > 24; 
 };
 
-// Pre-save middleware to set appointmentEndTime if not set
+// Pre-save middleware to set appointmentEndTime based on Service duration
 appointmentSchema.pre('save', async function(next) {
     if (this.isModified('appointmentTime') || !this.appointmentEndTime) {
         try {
@@ -120,22 +109,18 @@ appointmentSchema.statics.findUpcoming = function(query = {}) {
     return this.find({
         ...query,
         appointmentTime: { $gt: new Date() },
-        status: { $nin: ['cancelled', 'completed'] }
+        status: { $nin: ['cancelled', 'completed', 'no_show'] }
     }).sort({ appointmentTime: 1 });
 };
 
-// Static method to find conflicts
+// Static method to find scheduling conflicts
 appointmentSchema.statics.findConflicts = function(businessId, startTime, endTime, excludeId = null) {
     const query = {
         businessId,
         status: { $ne: 'cancelled' },
         $or: [
-            {
-                appointmentTime: { $lt: endTime, $gte: startTime }
-            },
-            {
-                appointmentEndTime: { $gt: startTime, $lte: endTime }
-            }
+            { appointmentTime: { $lt: endTime, $gte: startTime } },
+            { appointmentEndTime: { $gt: startTime, $lte: endTime } }
         ]
     };
 
@@ -146,6 +131,4 @@ appointmentSchema.statics.findConflicts = function(businessId, startTime, endTim
     return this.find(query);
 };
 
-const Appointment = mongoose.model('Appointment', appointmentSchema);
-
-module.exports = Appointment;
+module.exports = mongoose.model('Appointment', appointmentSchema);

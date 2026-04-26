@@ -1,154 +1,102 @@
-const { db, auth } = require('../utils/firebaseConfig');
-const bcrypt = require('bcrypt');
+// src/services/UserService.js
+const User = require('../models/userModel');
+const jwt = require('jsonwebtoken');
 
 class UserService {
-    constructor() {
-        this.db = db;
+    static generateToken(id, role) {
+        return jwt.sign(
+            { id, role }, 
+            process.env.JWT_SECRET || 'waitless-dev-secret', 
+            { expiresIn: '30d' }
+        );
     }
 
-    // Create a new user
-    async createUser(fullName, email, password, role = 'customer') {
-        try {
-            if (!fullName || !email || !password) {
-                throw new Error('Missing required fields: fullName, email, and password are required');
-            }
+    static async createUser(userData) {
+        const existingUser = await User.findOne({ email: userData.email });
+        if (existingUser) throw new Error('Email already exists');
 
-            // Hash the password
-            const saltRounds = 10;
-            const passwordHash = await bcrypt.hash(password, saltRounds);
+        const newUser = await User.create({
+            email: userData.email,
+            password: userData.password, 
+            full_name: userData.full_name,
+            role: userData.role || 'customer',
+            business_details: userData.business_details,
+            preferences: userData.preferences
+        });
 
-            // Create user in Firebase Authentication
-            const userRecord = await auth.createUser({
-                email,
-                password,
-                displayName: fullName,
-            });
+        const token = this.generateToken(newUser._id, newUser.role);
+        
+        const userResponse = newUser.toObject();
+        delete userResponse.password;
 
-            console.log('Firebase user created:', userRecord.uid);
-
-            // Store additional user data in Realtime Database
-            const userRef = this.db.ref(`users/${userRecord.uid}`);
-            await userRef.set({
-                fullName,
-                email,
-                passwordHash,
-                role,
-                createdAt: Date.now(),
-            });
-
-            console.log('User data stored in Realtime Database');
-
-            return {
-                uid: userRecord.uid,
-                email: userRecord.email,
-                fullName,
-                role,
-            };
-        } catch (error) {
-            console.error('Error creating user:', error);
-            if (error.code === 'auth/email-already-exists') {
-                throw new Error('Email already exists');
-            }
-            throw new Error(`Error creating user: ${error.message}`);
-        }
+        return { user: userResponse, token };
     }
 
-    // Get a user by email
-    async getUserByEmail(email) {
-        try {
-            const snapshot = await this.db.ref('users').orderByChild('email').equalTo(email).once('value');
+    static async loginUser(email, password) {
+        // Only look for active users!
+        const user = await User.findOne({ email, isActive: true }).select('+password');
+        if (!user) throw new Error('Invalid email or password');
 
-            if (!snapshot.exists()) {
-                throw new Error('User not found');
-            }
+        const isPasswordCorrect = await user.comparePassword(password);
+        if (!isPasswordCorrect) throw new Error('Invalid email or password');
 
-            const userId = Object.keys(snapshot.val())[0];
-            const user = snapshot.val()[userId];
+        const token = this.generateToken(user._id, user.role);
+        
+        const userResponse = user.toObject();
+        delete userResponse.password;
 
-            return { ...user, uid: userId };
-        } catch (error) {
-            console.error('Error fetching user by email:', error);
-            throw new Error(`Error fetching user: ${error.message}`);
-        }
+        return { user: userResponse, token };
     }
 
-    // Update user details
-    async updateUser(uid, updates) {
-        try {
-            if (!uid || !updates) {
-                throw new Error('Missing required fields: uid and updates are required');
-            }
-
-            // Update user data in Realtime Database
-            const userRef = this.db.ref(`users/${uid}`);
-            await userRef.update({
-                ...updates,
-                updatedAt: Date.now(),
-            });
-
-            console.log('User updated successfully');
-            return { uid, ...updates };
-        } catch (error) {
-            console.error('Error updating user:', error);
-            throw new Error(`Error updating user: ${error.message}`);
-        }
+    static async getAllUsers() {
+        // Only fetch active users
+        return await User.find({ isActive: true }, { password: 0 });
     }
 
-    // Delete (soft delete) a user
-    async deleteUser(uid) {
-        try {
-            if (!uid) {
-                throw new Error('Missing required field: uid');
-            }
-
-            // Mark user as deleted in Realtime Database
-            const userRef = this.db.ref(`users/${uid}`);
-            await userRef.update({
-                deletedAt: Date.now(),
-            });
-
-            console.log('User soft-deleted successfully');
-            return { uid, deletedAt: Date.now() };
-        } catch (error) {
-            console.error('Error deleting user:', error);
-            throw new Error(`Error deleting user: ${error.message}`);
-        }
+    static async getUserById(id) {
+        const user = await User.findOne({ _id: id, isActive: true }, { password: 0 });
+        if (!user) throw new Error('User not found');
+        return user;
     }
 
-    // Get all active users
-    async getAllUsers() {
-        try {
-            const snapshot = await this.db.ref('users').once('value');
-            if (!snapshot.exists()) {
-                return [];
-            }
+    // --------------------------------------------------------
+    // RESTORED FEATURE: Update User
+    // --------------------------------------------------------
+    static async updateUser(id, updateData) {
+        const user = await User.findOne({ _id: id, isActive: true });
+        if (!user) throw new Error('User not found');
 
-            const users = snapshot.val();
-            const activeUsers = Object.keys(users)
-                .filter((uid) => !users[uid].deletedAt)
-                .map((uid) => ({ uid, ...users[uid] }));
+        // Update fields safely
+        if (updateData.email) user.email = updateData.email;
+        if (updateData.full_name) user.full_name = updateData.full_name;
+        if (updateData.role) user.role = updateData.role;
+        if (updateData.business_details) user.business_details = updateData.business_details;
+        if (updateData.preferences) user.preferences = updateData.preferences;
+        if (updateData.profile_complete !== undefined) user.profile_complete = updateData.profile_complete;
 
-            return activeUsers;
-        } catch (error) {
-            console.error('Error fetching all users:', error);
-            throw new Error(`Error fetching users: ${error.message}`);
+        // If password is being updated, assigning it here triggers the pre-save hook to hash it!
+        if (updateData.password) {
+            user.password = updateData.password;
         }
+
+        await user.save();
+
+        const userResponse = user.toObject();
+        delete userResponse.password;
+        return userResponse;
     }
 
-    // Verify password for login
-    async verifyPassword(email, password) {
-        try {
-            const user = await this.getUserByEmail(email);
-            if (!user) {
-                throw new Error('User not found');
-            }
-
-            const isPasswordCorrect = await bcrypt.compare(password, user.passwordHash);
-            return isPasswordCorrect;
-        } catch (error) {
-            console.error('Error verifying password:', error);
-            throw new Error(`Error verifying password: ${error.message}`);
-        }
+    // --------------------------------------------------------
+    // RESTORED FEATURE: Delete User (Soft Delete)
+    // --------------------------------------------------------
+    static async deleteUser(id) {
+        const user = await User.findByIdAndUpdate(
+            id,
+            { isActive: false },
+            { new: true }
+        );
+        if (!user) throw new Error('User not found');
+        return true;
     }
 }
 

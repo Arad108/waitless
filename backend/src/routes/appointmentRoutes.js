@@ -1,37 +1,65 @@
 // src/routes/appointmentRoutes.js
 const express = require('express');
-const router = express.Router();
 const appointmentController = require('../controllers/appointmentController');
-const { verifyToken } = require('../middleware/authMiddleware');
+const { verifyToken, checkRole, isBusinessOwner } = require('../middleware/authMiddleware');
 
-// Apply authentication middleware to all routes
+const router = express.Router();
+
+// ==========================================
+// PUBLIC ROUTES (No login required)
+// ==========================================
+// Check available slots before booking
+router.get('/available-slots', appointmentController.getAvailableSlots);
+
+// ==========================================
+// 1. CUSTOMER ROUTES (Requires Login)
+// ==========================================
 router.use(verifyToken);
 
-// Schedule a new appointment
-router.post('/', appointmentController.scheduleAppointment);
+// Book a new appointment (Matches scheduleAppointment!)
+router.post('/schedule', appointmentController.scheduleAppointment);
 
-// Get all appointments (with query params for filtering)
-router.get('/', appointmentController.getAllAppointments);
+// Get the logged-in user's own booking history (Matches getCustomerAppointments!)
+router.get('/my-appointments', appointmentController.getCustomerAppointments);
 
-// Get appointments for a specific business
-router.get('/business/:businessId', appointmentController.getBusinessAppointments);
-
-// Get customer's appointments
-router.get('/customer', appointmentController.getCustomerAppointments); // Changed from /user
-
-// Get upcoming appointments
+// Get upcoming appointments only
 router.get('/upcoming', appointmentController.getUpcomingAppointments);
 
-// Get specific appointment by ID
+// Customer cancelling their own appointment
+router.patch('/:id/cancel', appointmentController.cancelAppointment);
+
+// Get a specific appointment by ID
 router.get('/:id', appointmentController.getAppointmentById);
 
-// Update appointment
-router.put('/:id', appointmentController.updateAppointment);
 
-// Cancel appointment
-router.put('/:id/cancel', appointmentController.cancelAppointment); // Changed from delete to put
+// ==========================================
+// 2. BUSINESS OWNER & STAFF ROUTES
+// ==========================================
+// Get all appointments for a specific business dashboard
+router.get(
+    '/business/:businessId', 
+    isBusinessOwner, 
+    appointmentController.getBusinessAppointments
+);
 
-// Get available slots
-router.get('/slots', appointmentController.getAvailableSlots);
+// Update appointment details (e.g., status, notes)
+router.put(
+    '/:id', 
+    (req, res, next) => {
+        // Map businessId so your isBusinessOwner middleware can catch it
+        if (req.body.businessId) {
+            req.params.id = req.body.businessId; 
+        }
+        next();
+    },
+    isBusinessOwner, 
+    appointmentController.updateAppointment
+);
+
+// ==========================================
+// 3. SYSTEM ADMIN ROUTES
+// ==========================================
+// View every single appointment across the entire platform
+router.get('/', checkRole('admin'), appointmentController.getAllAppointments);
 
 module.exports = router;
